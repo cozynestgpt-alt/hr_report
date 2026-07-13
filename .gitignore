@@ -1,6 +1,8 @@
-# 개인정보 포함 폴더 (매월 교체되는 실데이터)
-input/
-output/
+# 개인정보 포함 폴더 (매월 교체되는 실데이터) - 폴더 구조만 유지
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
 DB/
 참고/
 
