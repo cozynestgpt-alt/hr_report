@@ -3,8 +3,10 @@ input/*
 !input/.gitkeep
 output/*
 !output/.gitkeep
-DB/
-참고/
+DB/*
+!DB/.gitkeep
+참고/*
+!참고/.gitkeep
 
 # 엑셀 파일 전체 제외 (개인정보 우려) - 템플릿만 예외 허용
 *.xlsx
