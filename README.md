@@ -1,5 +1,7 @@
 # 월례회의 인원보고서 자동화
 
+GitHub: https://github.com/cozynestgpt-alt/hr_report
+
 ## 폴더 구조
 
 ```
