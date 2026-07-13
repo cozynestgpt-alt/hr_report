@@ -1,0 +1,19 @@
+# 개인정보 포함 폴더 (매월 교체되는 실데이터)
+input/
+output/
+DB/
+참고/
+
+# 엑셀 파일 전체 제외 (개인정보 우려) - 템플릿만 예외 허용
+*.xlsx
+!template/*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
