@@ -3,357 +3,378 @@
 사용법: python main.py [YYYYMM]
 예시:  python main.py 202605
        python main.py           ← 당월 자동 적용
+
+입력 파일:  input/부서별인원현황_YYYYMMDD.xlsx
+            컬럼 구조: 부서코드 | 부서 | 99년미만 | 계 | 평균
+            input/★월례회의_인원보고_양식.xlsx
+            → 중간관리·물류센터용역 수기입력 양식. 담당자가 매월 직접 갱신.
+              L2(기준일)가 당월 말일과 일치할 때만 자동 반영됨.
+
+출력 파일:  output/월례회의_인원보고_YYYYMM_생성일자.xlsx
+            (동일 파일 존재 시 _v2, _v3 ... 로 자동 증가, 기존 결과물은 덮어쓰지 않음)
+
+자동 생성 범위:
+  ○ 브랜드 사업부문 일반직 (행 5~19): input 파일 부서코드 기준 자동 집계
+  ○ 영업본부 백화점 일반직 (행 7):    원팀+올라운더팀 합산
+  ○ 영업본부 백화점 판매직 (행 7):    위탁매장(AR2xxx) 전체 합산
+  ○ 직영점 판매직 (행 21~32):          직영점별 자동 집계
+  ○ 중간관리 (행 34~37):               ★양식 파일 기준일 일치 시 자동 반영, 아니면 수동 입력
+  ○ 물류센터용역·평택점용역 (행 43~44): ★양식 파일 기준일 일치 시 자동 반영, 아니면 수동 입력
+  △ 신규입사자명단·퇴사자명단 시트:     수동 입력 필요
 """
 
 import sys
 import os
+import glob
 import shutil
 import subprocess
 import json
-from datetime import datetime, date
-from calendar import monthrange
+import calendar
+from datetime import date, datetime
 from pathlib import Path
 
-import pandas as pd
 from openpyxl import load_workbook
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 # ── 경로 설정 ─────────────────────────────────────────────
-BASE_DIR    = Path(__file__).parent
-INPUT_DIR   = BASE_DIR / "input"
-OUTPUT_DIR  = BASE_DIR / "output"
-TEMPLATE    = BASE_DIR / "template" / "월례회의_인원보고_템플릿.xlsx"
-RECALC      = BASE_DIR / "scripts" / "recalc.py"
+BASE_DIR   = Path(__file__).parent
+INPUT_DIR  = BASE_DIR / "input"
+OUTPUT_DIR = BASE_DIR / "output"
+TEMPLATE   = BASE_DIR / "template" / "월례회의_인원보고_템플릿.xlsx"
+RECALC     = BASE_DIR / "scripts" / "recalc.py"
+MANUAL_FILE = INPUT_DIR / "★월례회의_인원보고_양식.xlsx"   # 중간관리·물류센터용역 수기입력 양식 (담당자가 매월 갱신)
 
 REPORT_SHEET = "전년대비 인원증감현황"   # 템플릿 고정 시트명
-COMPARE_SHEET = "인원비교보고서"
 
+# ── 양식 파일에서 그대로 복사해오는 셀 (중간관리 행 34~37, 물류센터용역·평택점용역 43~44) ──
+MANUAL_COPY_CELLS = [f"{col}{r}" for r in (34, 35, 36, 37) for col in ("E", "F", "G", "H")] + ["C43", "C44"]
 
-# ── 인원 집계 함수 ────────────────────────────────────────
-def load_employee_list(input_dir: Path) -> pd.DataFrame:
-    """input 폴더에서 사원명단 파일 자동 탐색 후 로드"""
-    files = sorted(input_dir.glob("사원명단*.xlsx"))
-    if not files:
-        raise FileNotFoundError(f"input 폴더에 '사원명단*.xlsx' 파일이 없습니다: {input_dir}")
-    path = files[-1]  # 가장 최신 파일
-    print(f"  [사원명단] {path.name}")
-    df = pd.read_excel(path)
-    df["입사일"] = pd.to_datetime(df["입사일"], errors="coerce")
-    df["퇴사일"] = pd.to_datetime(df["퇴사일"], errors="coerce")
-    return df
+COL_CODE  = "부서코드"   # 부서코드 열
+COL_COUNT = "계"         # 인원수 열 (문자열로 저장됨)
 
-
-def is_active(row: pd.Series, ref_date: pd.Timestamp) -> bool:
-    """기준일 말일 재직 여부"""
-    if pd.isna(row["입사일"]) or row["입사일"] > ref_date:
-        return False
-    if not pd.isna(row["퇴사일"]) and row["퇴사일"] < ref_date:
-        return False
-    return True
-
-
-def classify_type(row: pd.Series) -> str:
-    """사원구분 → 일반 / 판매"""
-    return "일반" if row["사원구분"] in ("연봉직", "호봉직") else "판매"
-
-
-def build_headcount(df: pd.DataFrame, ref_date: pd.Timestamp) -> dict:
-    """기준일 기준 부서별 인원수 dict 반환
-    key: (구분1, 구분2), value: {"일반": n, "판매": n}
-
-    집계 전략:
-    - 구분2가 있는 경우 → (구분1, 구분2) 키로 집계
-    - 구분2가 없는 경우 → (구분1, 구분1) 키로 집계  ← 임원/온라인사업부/AMD/CXD/ETC 등
-    """
-    active = df[df.apply(lambda r: is_active(r, ref_date), axis=1)].copy()
-    active["타입"] = active.apply(classify_type, axis=1)
-
-    counts: dict = {}
-    for _, row in active.iterrows():
-        g1 = str(row.get("구분1", "") or "").strip()
-        g2_raw = row.get("구분2", "")
-        g2 = str(g2_raw).strip() if (g2_raw and str(g2_raw) not in ("nan", "None", "")) else g1
-        t  = row["타입"]
-        key = (g1, g2)
-        counts.setdefault(key, {"일반": 0, "판매": 0})
-        counts[key][t] += 1
-    return counts
-
-
-# ── 인원비교보고서 시트 읽기 ──────────────────────────────
-def read_compare_sheet(wb) -> dict:
-    """인원비교보고서 시트 → {(구분1,구분2): {전년일반, 전년판매, 당해일반, 당해판매}}"""
-    ws = wb[COMPARE_SHEET]
-    data = {}
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[0] and row[1]:
-            key = (str(row[0]).strip(), str(row[1]).strip())
-            data[key] = {
-                "전년일반": row[2] or 0,
-                "전년판매": row[3] or 0,
-                "당해일반": row[4] or 0,
-                "당해판매": row[5] or 0,
-            }
-    return data
-
-
-# ── 전년대비 시트 행→데이터 매핑 ──────────────────────────
-# (행번호, 구분1, 구분2, "일반" or "판매")
-ROW_MAP = [
-    # 브랜드사업부문 (일반)
-    (5,  "임원",        "임원",        "일반"),
-    (6,  "영업본부",    "총괄",        "일반"),
-    (7,  "영업본부",    "백화점",      "일반"),
-    (8,  "영업본부",    "SMD",         "일반"),
-    (9,  "영업본부",    "영업지원",    "일반"),
-    (10, "온라인사업부","온라인사업부","일반"),
-    (11, "상품본부",    "총괄",        "일반"),
-    (12, "상품본부",    "PDD",         "일반"),
-    (13, "상품본부",    "MMD",         "일반"),
-    (14, "RND",         "총괄",        "일반"),
-    (15, "RND",         "RND",         "일반"),
-    (16, "RND",         "VMD",         "일반"),
-    (17, "AMD",         "AMD",         "일반"),
-    (18, "CXD",         "CXD",         "일반"),
-    (19, "ETC",         "ETC",         "일반"),
-    # 직영점 (판매)
-    (21, "직영점",      "양재점",                  "판매"),
-    (22, "직영점",      "일산점",                  "판매"),
-    (23, "직영점",      "경기광주점",              "판매"),
-    (24, "직영점",      "전주점",                  "판매"),
-    (25, "직영점",      "NC충장점",                "판매"),
-    (26, "직영점",      "NC불광점",                "판매"),
-    (27, "직영점",      "청주점",                  "판매"),
-    (28, "직영점",      "NC해운대점",              "판매"),
-    (29, "직영점",      "NC일산점",                "판매"),
-    (30, "직영점",      "고양터미널점(롯데아울렛)","판매"),
-    (31, "직영점",      "가든5점_현대아울렛",      "판매"),
-    (32, "직영점",      "현대커넥트부산점",        "판매"),
-]
-
-# 인원비교보고서에 없는 키의 고정값 처리
-# 고양터미널점: 이윤정 1명(일산점 소속 파견)으로 사원명단 직접 집계
-SPECIAL_ROWS = {
-    (30, "직영점", "고양터미널점(롯데아울렛)", "판매"): "by_dept",  # 이윤정: 일산점 AR1800
+# ── 구 부서코드 → 현 부서코드 매핑 ────────────────────────
+#   전년도 파일에 구 코드가 남아있을 경우 현 코드로 통합
+OLD_CODE_MAP = {
+    "AR1300": "AR3104",   # ETC 구 코드
+    "AR3101": "AR3102",   # PLD → PDD 통합
+    "AR3103": "AR3105",   # PMD → MMD 통합
 }
 
+# ── 직영점으로 분류되는 AR2xxx 코드 (영업본부 백화점 집계에서 제외) ──
+JIKGYEONG_AR2 = {"AR2501", "AR2683"}
 
-def get_special_count(g1, g2, year_key, df_all, ref_date):
-    """인원비교보고서에 없는 행 직접 계산 (고양터미널 등)"""
-    # 현재는 이윤정(일산점) 1명 고정 → 재직 여부만 확인
-    if g2 == "고양터미널점(롯데아울렛)":
-        yoon = df_all[(df_all["성명"] == "이윤정") & (df_all["사번"] == 465)]
-        if yoon.empty:
-            return 1  # fallback
-        row = yoon.iloc[0]
-        return 1 if is_active(row, ref_date) else 0
-    return 0
+# ── 보고서 행 구조 ─────────────────────────────────────────
+# 형식: (엑셀행번호, 설명, [일반직 부서코드], [판매직 부서코드])
+#   - 빈 리스트 []                    → 해당 구분 집계 없음 (셀 유지)
+#   - "AR2_ALL_EXCEPT_JIKGYEONG"      → AR2xxx 전체 합산(직영점 제외)
+#   - "SKIP"                          → 행을 건드리지 않음 (수동 입력 전용)
+REPORT_ROWS = [
+    # ── 브랜드 사업부문 ───────────────────────────────────────
+    (5,  "임원",             ["AR1003", "AR1005", "AR1006"], []),
+    (6,  "영업본부_총괄",     ["AR4100"], []),
+    (7,  "영업본부_백화점",   ["AR4104", "AR4105"],                # 일반: 원팀 + 올라운더팀
+                               "AR2_ALL_EXCEPT_JIKGYEONG"),        # 판매: AR2xxx 전체 (직영점 제외)
+    (8,  "영업본부_SMD",      ["AR4103"], []),
+    (9,  "영업본부_영업지원", ["AR4101"], []),
+    (10, "온라인사업부",      ["AR1700"], []),
+    (11, "상품본부_총괄",     ["AR3100"], []),
+    (12, "상품본부_PDD",      ["AR3102"], []),                     # PLD(AR3101) → AR3102 로 통합
+    (13, "상품본부_MMD",      ["AR3105"], []),                     # PMD(AR3103) → AR3105 로 통합
+    (14, "RND_총괄",          ["AR1101"], []),
+    (15, "RND",               ["AR1121", "AR1122", "AR1123"], []),
+    (16, "VMD",               ["AR1117"], []),
+    (17, "AMD",               ["AR1200"], []),
+    (18, "CXD",               ["AR1510"], []),
+    (19, "ETC",               ["AR3104"], []),                    # 구 ETC(AR1300) → AR3104
+    # ── 직영점 (판매직만) ─────────────────────────────────────
+    (21, "직영점_양재점",             [], ["AR1960"]),
+    (22, "직영점_일산점",             [], ["AR1800"]),
+    (23, "직영점_경기광주점",         [], ["AR1790"]),
+    (24, "직영점_전주점",             [], ["AR1910"]),
+    (25, "직영점_NC충장점",           [], ["AR1940"]),
+    (26, "직영점_NC불광점",           [], ["AR1950"]),
+    (27, "직영점_청주점",             [], ["AR1970"]),
+    (28, "직영점_NC해운대점",         [], ["AR1980"]),
+    (29, "직영점_NC일산점",           [], ["AR1981"]),
+    (30, "직영점_고양점(롯데아울렛)", [], ["AR2501"]),
+    (31, "직영점_가든5점_현대아울렛", [], ["AR2683"]),
+    (32, "직영점_현대커넥트부산점",   [], ["AR1982"]),
+    # ── 중간관리 (수동 입력) ──────────────────────────────────
+    (34, "중간관리_롯데   ← 수동입력", "SKIP", "SKIP"),
+    (35, "중간관리_현대   ← 수동입력", "SKIP", "SKIP"),
+    (36, "중간관리_신세계 ← 수동입력", "SKIP", "SKIP"),
+    (37, "중간관리_갤러리아← 수동입력", "SKIP", "SKIP"),
+]
 
 
-# ── 변동사항 분석 ─────────────────────────────────────────
-def analyze_changes(compare_data: dict, target_year: str, prev_year: str) -> list[str]:
-    """증감 현황을 텍스트 리스트로 반환"""
-    lines = []
-    for (g1, g2), v in compare_data.items():
-        if g1 == "인원수합계":
+# ── 내부 함수 ─────────────────────────────────────────────
+def last_day(year: int, month: int) -> date:
+    return date(year, month, calendar.monthrange(year, month)[1])
+
+
+def find_file(year: int, month: int) -> Path | None:
+    end = last_day(year, month)
+    exact = INPUT_DIR / f"부서별인원현황_{end:%Y%m%d}.xlsx"
+    if exact.exists():
+        return exact
+    pattern = str(INPUT_DIR / f"부서별인원현황_{year}{month:02d}*.xlsx")
+    cands = sorted(glob.glob(pattern))
+    if cands:
+        print(f"  ※ 말일자 파일 없음 → 사용: {os.path.basename(cands[-1])}")
+        return Path(cands[-1])
+    return None
+
+
+def read_counts(filepath: Path) -> dict:
+    """부서별인원현황 파일 → {부서코드: 인원수} 딕셔너리 반환"""
+    wb = load_workbook(filepath, data_only=True)
+    ws = wb.active
+
+    hdr_row = col_code = col_count = None
+    for r in ws.iter_rows(max_row=10):
+        for c in r:
+            v = str(c.value).strip() if c.value is not None else ""
+            if v == COL_CODE:
+                col_code = c.column
+                hdr_row = c.row
+            if v == COL_COUNT:
+                col_count = c.column
+        if hdr_row:
+            break
+
+    if hdr_row is None:
+        raise ValueError(
+            f"헤더 행을 찾지 못했습니다: {filepath}\n"
+            f"  → COL_CODE='{COL_CODE}', COL_COUNT='{COL_COUNT}' 확인 필요"
+        )
+
+    result = {}
+    for row in ws.iter_rows(min_row=hdr_row + 1, values_only=True):
+        raw_code = row[col_code - 1]
+        raw_count = row[col_count - 1]
+        if not raw_code:
             continue
-        curr_gen = v.get("당해일반", 0)
-        prev_gen = v.get("전년일반", 0)
-        curr_sal = v.get("당해판매", 0)
-        prev_sal = v.get("전년판매", 0)
-        diff_gen = curr_gen - prev_gen
-        diff_sal = curr_sal - prev_sal
-        if diff_gen != 0:
-            sign = "▲" if diff_gen > 0 else "▼"
-            lines.append(f"  {g1}/{g2} 일반 {sign}{abs(diff_gen)}명 ({prev_gen}→{curr_gen})")
-        if diff_sal != 0:
-            sign = "▲" if diff_sal > 0 else "▼"
-            lines.append(f"  {g1}/{g2} 판매 {sign}{abs(diff_sal)}명 ({prev_sal}→{curr_sal})")
-    return lines
+        code = OLD_CODE_MAP.get(str(raw_code).strip(), str(raw_code).strip())
+        try:
+            n = int(float(str(raw_count).strip()))
+        except (ValueError, TypeError):
+            print(f"  ⚠ 인원수 파싱 실패 → 0으로 처리: {filepath.name} 부서코드={code} 값={raw_count!r}")
+            n = 0
+        result[code] = result.get(code, 0) + n
+
+    wb.close()
+    return result
+
+
+def read_manual_values(cy_end: date):
+    """★월례회의_인원보고_양식.xlsx(중간관리·물류센터용역 수기입력 양식)에서 값을 읽어온다.
+    파일이 없거나 L2(기준일)가 당월 말일과 다르면 (None, 사유)를 반환해 수동 입력으로 넘긴다."""
+    if not MANUAL_FILE.exists():
+        return None, f"{MANUAL_FILE.name} 없음"
+
+    wb = load_workbook(MANUAL_FILE, data_only=True)
+    if REPORT_SHEET not in wb.sheetnames:
+        wb.close()
+        return None, f"{MANUAL_FILE.name}에 '{REPORT_SHEET}' 시트 없음"
+    ws = wb[REPORT_SHEET]
+
+    l2 = ws["L2"].value
+    l2_date = l2.date() if isinstance(l2, datetime) else l2
+    if l2_date != cy_end:
+        wb.close()
+        return None, f"{MANUAL_FILE.name} 기준일({l2_date}) ≠ 당월 말일({cy_end}) → 파일 갱신 필요"
+
+    values = {cell: ws[cell].value for cell in MANUAL_COPY_CELLS}
+    wb.close()
+    return values, None
+
+
+def calc(data: dict, codes) -> int:
+    """codes: 리스트 또는 특수값 처리"""
+    if codes == "SKIP" or not codes:
+        return 0
+    if codes == "AR2_ALL_EXCEPT_JIKGYEONG":
+        return sum(v for k, v in data.items()
+                   if k.startswith("AR2") and k not in JIKGYEONG_AR2)
+    return sum(data.get(c, 0) for c in codes)
 
 
 # ── 메인 처리 ─────────────────────────────────────────────
 def main():
-    # 기준월 파싱
     if len(sys.argv) >= 2:
         ym = sys.argv[1].strip()
-        if len(ym) != 6 or not ym.isdigit():
-            print("❌ 기준월 형식 오류: YYYYMM 형태로 입력하세요 (예: 202605)")
-            sys.exit(1)
-        year, month = int(ym[:4]), int(ym[4:])
     else:
         today = date.today()
-        year, month = today.year, today.month
-        ym = f"{year}{month:02d}"
+        ym = f"{today.year}{today.month:02d}"
         print(f"  기준월 미입력 → 당월 적용: {ym}")
 
-    last_day    = monthrange(year, month)[1]
-    ref_date    = pd.Timestamp(year, month, last_day)          # 기준년월 말일
-    prev_year   = year - 1
-    prev_date   = pd.Timestamp(prev_year, month, monthrange(prev_year, month)[1])
+    if len(ym) != 6 or not ym.isdigit():
+        print("오류: YYYYMM 형식이어야 합니다 (예: 202605)")
+        sys.exit(1)
 
-    print(f"\n{'='*55}")
-    print(f"  월례회의 인원보고서 자동화  |  기준: {year}년 {month:02d}월 말일")
-    print(f"  비교: {prev_year}년 {month:02d}월 말일 대비")
-    print(f"{'='*55}\n")
+    cy_y, cy_m = int(ym[:4]), int(ym[4:])
+    py_y, py_m = cy_y - 1, cy_m
+    cy_end = last_day(cy_y, cy_m)
+    py_end = last_day(py_y, py_m)
 
-    # ── 1. 사원명단 로드 ──────────────────────────────────
-    print("[1/5] 사원명단 로드 중...")
-    df = load_employee_list(INPUT_DIR)
-    print(f"  총 {len(df)}명 (전체 이력 포함)")
+    print(f"\n{'='*65}")
+    print(f"  보고 대상: {cy_y}년 {cy_m:02d}월    전년동월: {py_y}년 {py_m:02d}월")
+    print(f"  당년 말일: {cy_end}    전년 말일: {py_end}")
+    print(f"{'='*65}\n")
 
-    # ── 2. 인원비교보고서 업데이트 ────────────────────────
-    print("[2/5] 인원비교보고서 집계 중...")
-    cnt_curr = build_headcount(df, ref_date)
-    cnt_prev = build_headcount(df, prev_date)
+    # 파일 탐색
+    print("[1/4] 파일 탐색...")
+    cy_file = find_file(cy_y, cy_m)
+    py_file = find_file(py_y, py_m)
 
-    target_year_str = str(year)
-    prev_year_str   = str(prev_year)
+    if not cy_file:
+        print(f"\n  오류: 당월 파일 없음\n  → {INPUT_DIR}\\부서별인원현황_{cy_end:%Y%m%d}.xlsx")
+        sys.exit(1)
+    if not py_file:
+        print(f"\n  오류: 전년동월 파일 없음\n  → {INPUT_DIR}\\부서별인원현황_{py_end:%Y%m%d}.xlsx")
+        sys.exit(1)
 
-    # 인원비교보고서 헤더 갱신 (날짜 표시용)
-    # C1~F1은 플레이스홀더 → 실제 연월 텍스트로 교체
+    print(f"  당년: {cy_file.name}")
+    print(f"  전년: {py_file.name}")
 
+    # 인원 읽기
+    print("\n[2/4] 인원 데이터 읽기...")
+    cy = read_counts(cy_file)
+    py = read_counts(py_file)
 
-    output_path = OUTPUT_DIR / f"월례회의_인원보고_{ym}.xlsx"
-    shutil.copy(TEMPLATE, output_path)
+    # 미매핑 부서 코드 경고
+    mapped_codes = set(OLD_CODE_MAP.keys())
+    for _, _, gc, sc in REPORT_ROWS:
+        if isinstance(gc, list):
+            mapped_codes.update(gc)
+        if isinstance(sc, list):
+            mapped_codes.update(sc)
+    mapped_codes.update(JIKGYEONG_AR2)
+    unk = set()
+    for code in (set(cy) | set(py)):
+        if code not in mapped_codes and not (code.startswith("AR2") and code not in JIKGYEONG_AR2):
+            unk.add(code)
+    if unk:
+        print(f"\n  ⚠ 보고서에 매핑되지 않은 부서코드 (REPORT_ROWS 에 추가 검토 필요):")
+        for u in sorted(unk):
+            print(f"    {u}  전년:{py.get(u, 0):>2}명  당년:{cy.get(u, 0):>2}명")
+
+    # 양식 복사
+    print("\n[3/4] 보고서 생성...")
+    if not TEMPLATE.exists():
+        print(f"\n  오류: 템플릿 파일 없음\n  → {TEMPLATE}")
+        sys.exit(1)
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    today_str = date.today().strftime("%Y%m%d")
+    base_path = OUTPUT_DIR / f"월례회의_인원보고_{ym}_{today_str}.xlsx"
+    if not base_path.exists():
+        output_path = base_path
+    else:
+        version = 2
+        while True:
+            output_path = OUTPUT_DIR / f"월례회의_인원보고_{ym}_{today_str}_v{version}.xlsx"
+            if not output_path.exists():
+                break
+            version += 1
+        print(f"  ※ 동일 파일 존재 → 새 파일명: {output_path.name}")
+    shutil.copy2(TEMPLATE, output_path)
 
     wb = load_workbook(output_path)
+    ws = wb[REPORT_SHEET]
 
-    # 인원비교보고서 헤더 연월 갱신
-    ws_cmp = wb[COMPARE_SHEET]
-    ws_cmp['C1'] = f'{prev_year}년 {month:02d}월_일반'
-    ws_cmp['D1'] = f'{prev_year}년 {month:02d}월_판매'
-    ws_cmp['E1'] = f'{year}년 {month:02d}월_일반'
-    ws_cmp['F1'] = f'{year}년 {month:02d}월_판매'
+    ws["L2"] = datetime(cy_y, cy_m, cy_end.day)
 
-    # 인원비교보고서 시트 갱신
-    for row in ws_cmp.iter_rows(min_row=2):
-        g1 = str(row[0].value or "").strip()
-        g2 = str(row[1].value or "").strip()
-        if not g1 or not g2 or g1 == "인원수합계":
+    # 중간관리·물류센터용역 양식 파일 확인 (기준일 일치 시에만 자동 반영)
+    manual_values, manual_skip_reason = read_manual_values(cy_end)
+    if manual_values:
+        print(f"  ✅ {MANUAL_FILE.name} 기준일 확인 완료 → 중간관리·물류센터용역 자동 반영")
+    else:
+        print(f"  ⚠️  중간관리·물류센터용역 자동 반영 건너뜀 ({manual_skip_reason})")
+
+    # 값 채우기
+    print(f"\n  {'행':>3}  {'항목':<30}  {'전년일반':>7} {'당년일반':>7}  {'전년판매':>7} {'당년판매':>7}")
+    print(f"  {'─'*3}  {'─'*30}  {'─'*7} {'─'*7}  {'─'*7} {'─'*7}")
+
+    for row_no, label, g_codes, s_codes in REPORT_ROWS:
+        if g_codes == "SKIP" and s_codes == "SKIP":
+            if manual_values:
+                vals = {c: manual_values[f"{c}{row_no}"] for c in ("E", "F", "G", "H")}
+                for c, v in vals.items():
+                    ws[f"{c}{row_no}"] = v
+                print(f"  {row_no:>3}  {label:<30}  {vals['E'] or 0:>7} {vals['G'] or 0:>7}  {vals['F'] or 0:>7} {vals['H'] or 0:>7}")
+            else:
+                print(f"  {row_no:>3}  {label:<30}  {'(수동)':>7} {'(수동)':>7}  {'(수동)':>7} {'(수동)':>7}")
             continue
-        key = (g1, g2)
-        p_gen = cnt_prev.get(key, {}).get("일반", 0)
-        p_sal = cnt_prev.get(key, {}).get("판매", 0)
-        c_gen = cnt_curr.get(key, {}).get("일반", 0)
-        c_sal = cnt_curr.get(key, {}).get("판매", 0)
-        row[2].value = p_gen   # C: 전년 일반
-        row[3].value = p_sal   # D: 전년 판매
-        row[4].value = c_gen   # E: 당해 일반
-        row[5].value = c_sal   # F: 당해 판매
-        row[6].value = c_gen - p_gen  # 일반 증감
-        row[7].value = round((c_gen - p_gen) / p_gen, 6) if p_gen else None
-        row[8].value = c_sal - p_sal  # 판매 증감
-        row[9].value = round((c_sal - p_sal) / p_sal, 6) if p_sal else None
 
-    # 합계행 갱신
-    total_p_gen = sum(v.get("일반", 0) for v in cnt_prev.values())
-    total_p_sal = sum(v.get("판매", 0) for v in cnt_prev.values())
-    total_c_gen = sum(v.get("일반", 0) for v in cnt_curr.values())
-    total_c_sal = sum(v.get("판매", 0) for v in cnt_curr.values())
+        py_g = calc(py, g_codes)
+        cy_g = calc(cy, g_codes)
+        py_s = calc(py, s_codes)
+        cy_s = calc(cy, s_codes)
 
-    # 인원비교보고서 합계행도 갱신
+        if g_codes and g_codes != "SKIP":
+            ws[f"E{row_no}"] = py_g or None
+            ws[f"G{row_no}"] = cy_g or None
+        if s_codes and s_codes != "SKIP":
+            ws[f"F{row_no}"] = py_s or None
+            ws[f"H{row_no}"] = cy_s or None
 
-    for row in ws_cmp.iter_rows(min_row=2):
-        if str(row[0].value or "").strip() == "인원수합계":
-            row[2].value = total_p_gen
-            row[3].value = total_p_sal
-            row[4].value = total_c_gen
-            row[5].value = total_c_sal
-            row[6].value = total_c_gen - total_p_gen
-            row[8].value = total_c_sal - total_p_sal
-            break
+        print(f"  {row_no:>3}  {label:<30}  {py_g:>7} {cy_g:>7}  {py_s:>7} {cy_s:>7}")
 
-    # ── 3. 전년대비 시트 L2(기준일) 갱신 ────────────────
-    print("[3/5] 전년대비 시트 채우는 중...")
-    ws_rep = wb[REPORT_SHEET]
-    import datetime as dt
-    ws_rep["L2"] = dt.date(year, month, last_day)
+    if manual_values:
+        ws["C43"] = manual_values["C43"]
+        ws["C44"] = manual_values["C44"]
+        print(f"  {'43':>3}  {'물류센터용역':<30}  {manual_values['C43']!s:>7}")
+        print(f"  {'44':>3}  {'평택점용역':<30}  {manual_values['C44']!s:>7}")
 
-    compare_data = read_compare_sheet(wb)  # 방금 갱신된 시트 재읽기
-
-    for row_num, g1, g2, type_ in ROW_MAP:
-        key = (g1, g2)
-        if key in compare_data:
-            p_val = compare_data[key]["전년일반" if type_ == "일반" else "전년판매"]
-            c_val = compare_data[key]["당해일반" if type_ == "일반" else "당해판매"]
-        else:
-            # 인원비교보고서에 없는 행(고양터미널 등) 직접 계산
-            p_val = get_special_count(g1, g2, prev_year_str, df, prev_date)
-            c_val = get_special_count(g1, g2, target_year_str, df, ref_date)
-
-        if type_ == "일반":
-            ws_rep.cell(row_num, 5).value = p_val   # E: 전년 일반
-            ws_rep.cell(row_num, 7).value = c_val   # G: 당해 일반
-        else:
-            ws_rep.cell(row_num, 6).value = p_val   # F: 전년 판매
-            ws_rep.cell(row_num, 8).value = c_val   # H: 당해 판매
-
-    # 백화점 행 판매칸 0 고정 (기존 #REF! 수식 제거)
-    ws_rep["F7"] = 0
-    ws_rep["H7"] = 0
-
-    # 증감율 수식에서 분모=0일 때 DIV/0! 방지 (J12, J13 등 IF 수식 → IFERROR로 교체)
-    for r in range(5, 40):
-        cell = ws_rep.cell(r, 10)  # J열
-        if cell.value and str(cell.value).startswith("=IF("):
-            # =IF(Ix/Ex=0,"",Ix/Ex) → =IFERROR(IF(Ix/Ex=0,"",Ix/Ex),"")
-            cell.value = f'=IFERROR({cell.value[1:]},"")' 
-
-    # ── 4. 저장 및 수식 재계산 ────────────────────────────
-    print("[4/5] 파일 저장 및 수식 재계산 중...")
     wb.save(output_path)
+    wb.close()
 
+    # ── 수식 재계산 (LibreOffice, 설치되어 있는 경우에만) ──
+    print("\n[4/4] 수식 재계산 중...")
     result = subprocess.run(
         [sys.executable, str(RECALC), str(output_path), "60"],
         capture_output=True, text=True
     )
-    recalc_info = json.loads(result.stdout) if result.stdout else {}
-    if recalc_info.get("status") == "errors_found":
+    recalc_info = None
+    if result.stdout:
+        try:
+            recalc_info = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            recalc_info = None
+
+    if recalc_info is None:
+        print("  ⚠️  수식 재계산을 건너뜁니다 (LibreOffice 미설치 또는 실행 실패).")
+        print("     엑셀에서 파일을 열면 수식은 정상적으로 자동 계산됩니다.")
+        if result.stderr:
+            print(f"     상세: {result.stderr.strip().splitlines()[-1]}")
+    elif recalc_info.get("status") == "errors_found":
         print(f"  ⚠️  수식 오류 {recalc_info['total_errors']}건: {recalc_info.get('error_summary', {})}")
+    elif "error" in recalc_info:
+        print(f"  ⚠️  수식 재계산 실패: {recalc_info['error']}")
     else:
         print(f"  ✅ 수식 재계산 완료 (수식 {recalc_info.get('total_formulas', '?')}개)")
 
-    # ── 5. 변동사항 요약 텍스트 생성 ─────────────────────
-    print("[5/5] 변동사항 요약 작성 중...")
-    changes = analyze_changes(compare_data, target_year_str, prev_year_str)
-
-    summary_lines = [
-        f"전년동월대비 인원증감 현황 요약",
-        f"기준: {year}년 {month:02d}월 말일 / 비교: {prev_year}년 {month:02d}월 말일",
-        f"생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "=" * 50,
-        f"【 전체 현황 】",
-        f"  구분    | {prev_year}.{month:02d} | {year}.{month:02d} | 증감",
-        f"  --------|-------|-------|-----",
-        f"  일반직  | {total_p_gen:5}명 | {total_c_gen:5}명 | {total_c_gen-total_p_gen:+}명",
-        f"  판매직  | {total_p_sal:5}명 | {total_c_sal:5}명 | {total_c_sal-total_p_sal:+}명",
-        f"  합  계  | {total_p_gen+total_p_sal:5}명 | {total_c_gen+total_c_sal:5}명 | {(total_c_gen+total_c_sal)-(total_p_gen+total_p_sal):+}명",
-        "=" * 50,
-    ]
-
-    if changes:
-        summary_lines += ["【 부서별 증감 내역 】"] + changes
-    else:
-        summary_lines += ["【 부서별 증감 내역 】", "  전년 동월 대비 변동 없음"]
-
-    summary_lines += [
-        "=" * 50,
-        f"출력 파일: {output_path.name}",
-    ]
-
-    summary_text = "\n".join(summary_lines)
-    summary_path = OUTPUT_DIR / f"인원변동요약_{ym}.txt"
-    summary_path.write_text(summary_text, encoding="utf-8-sig")
-
-    # ── 완료 출력 ──────────────────────────────────────────
-    print(f"\n{'='*55}")
-    print(f"  ✅ 완료!")
-    print(f"  📊 엑셀  : output/{output_path.name}")
-    print(f"  📄 요약  : output/{summary_path.name}")
-    print(f"{'='*55}\n")
-    print(summary_text)
+    print(f"\n{'='*65}")
+    print(f"  ✅ 완료!  → {output_path}")
+    print(f"{'='*65}\n")
+    print("  ★ Excel 열기 후 수동 입력 필요 항목:")
+    if not manual_values:
+        print(f"    · 행 34~37: 중간관리 (롯데/현대/신세계/갤러리아) 전년·당년 인원")
+        print(f"    · 행 43~44: 물류센터용역·평택점용역 인원")
+        print(f"      → input/{MANUAL_FILE.name} 을(를) 당월 기준으로 갱신 후 재실행하면 자동 반영됩니다 ({manual_skip_reason})")
+    print("    · 신규입사자명단·퇴사자명단 시트")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\n[오류 발생]\n  {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

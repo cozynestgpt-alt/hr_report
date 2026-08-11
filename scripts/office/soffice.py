@@ -46,8 +46,10 @@ def _needs_shim() -> bool:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.close()
         return False
-    except OSError:
-        return True
+    except (OSError, AttributeError):
+        # AttributeError: platform (e.g. Windows) has no AF_UNIX at all,
+        # which means there's no sandboxed-VM socket restriction to shim.
+        return False
 
 
 def _ensure_shim() -> Path:
